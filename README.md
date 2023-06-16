@@ -11,7 +11,7 @@
 `$ git clone https://github.com/mberiane/Rust_Challenge.git `
 
 ### 2. Configure exports
-`$ export SYMBOL= « ethbtc »`
+`$ export SYMBOL="ethbtc"`
 `$ export RUST_LOG=debug`
 
 ### 2.  Run the code:
