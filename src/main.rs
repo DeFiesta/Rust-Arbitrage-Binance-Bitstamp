@@ -27,12 +27,12 @@ use tonic::transport::Server;
 use serde_json::Value;
 use env_logger;
 
-// your gRPC service implementations
+// gRPC server implementations
 mod orderbook {
     tonic::include_proto!("orderbook"); 
 }
 
-
+//initiate the orderbook struct
 #[derive(Debug)]
 pub struct OrderBook {
     bids: Vec<orderbook::Level>,
@@ -83,7 +83,7 @@ impl MyOrderbookAggregator {
     }
 }
 
-
+// implementation of the gRPC server-side functions 
 #[tonic::async_trait]
 impl OrderbookAggregator for MyOrderbookAggregator {
     type BookSummaryStream = Pin<Box<dyn Stream<Item = Result<Summary, Status>> + Send + Sync + 'static>>;
@@ -148,6 +148,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Err(err) => eprintln!("Error occurred: {:?}", err),
     }
 
+    // launch gRPC server
     let addr = "[::1]:50051".parse().unwrap();
     let orderbook_aggregator = MyOrderbookAggregator::new(Arc::clone(&order_book));
 
@@ -159,6 +160,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+//Merges orderbooks fetched by websocket functions
 async fn run(url_binance: String, url_bitstamp: String, symbol: String, order_book: Arc<Mutex<OrderBook>>,) -> anyhow::Result<()> {
     let binance_orderbook = Arc::clone(&order_book);
     let bitstamp_orderbook = Arc::clone(&order_book);
@@ -170,17 +172,13 @@ async fn run(url_binance: String, url_bitstamp: String, symbol: String, order_bo
         connect_to_exchange(url_bitstamp, "bitstamp", &symbol, bitstamp_orderbook).await
     });
     let _ = tokio::try_join!(binance, bitstamp)?;
-
     let _order_book_guard = order_book.lock().await;
-    //println!("Final Bids: {:?}", order_book_guard.bids);
-    //println!("Final Asks: {:?}", order_book_guard.asks);
-    //println!("Final Spread: {:?}", order_book_guard.spread);
 
     Ok(())
 }
 
 
-
+// connect websocket to chosen exchange
 async fn connect_to_exchange(url: String, exchange: &str, symbol: &str, order_book: Arc<Mutex<OrderBook>>) -> anyhow::Result<()> {
     
     if exchange == "binance" {
@@ -306,12 +304,11 @@ async fn connect_to_exchange(url: String, exchange: &str, symbol: &str, order_bo
     Ok(())
 }
 
-
+// parses the data to separate bids and asks fetched and fills the orderbook based on the proto arcchitecture 
 fn parse_order_book_update(message: &str, exchange: &str) -> anyhow::Result<OrderBook> {
     
     let v: Value = serde_json::from_str(message)?;
 
-    // Modify this to get 'data' first for Bitstamp
     if exchange == "bitstamp" {
         if let Some(data) = v.get("data") {
             let bids = data["bids"]
