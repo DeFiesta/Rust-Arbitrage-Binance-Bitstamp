@@ -4,7 +4,7 @@ use tokio_tungstenite::tungstenite::protocol::Message as TMessage;
 use tungstenite::Message;
 use url::Url;
 
-use futures::Stream;
+use futures::stream::{self, Stream};
 use futures::StreamExt;
 use futures::SinkExt;
 
@@ -13,12 +13,15 @@ use std::error::Error;
 use tokio::sync::Mutex;
 use std::sync::Arc;
 use std::pin::Pin;
-use core::time::Duration;
 use log::error;
 use serde_json::json;
 
-use orderbook::{orderbook_aggregator_server::{OrderbookAggregator, OrderbookAggregatorServer}, Summary, Empty};
+// gRPC crates
+use orderbook::orderbook_aggregator_server::{OrderbookAggregator, OrderbookAggregatorServer};
+use orderbook::{Summary, Level, Empty};
 use tonic::{Request, Response, Status};
+use tonic::transport::Server;
+
 
 // used to parse orderbook update
 use serde_json::Value;
@@ -34,28 +37,38 @@ mod orderbook {
 pub struct OrderBook {
     bids: Vec<orderbook::Level>,
     asks: Vec<orderbook::Level>,
+    spread: f64,
 }
 
 #[derive(Debug)]
-pub struct OrderbookAggregatorImpl {
+pub struct MyOrderbookAggregator {
     pub order_book: Arc<Mutex<OrderBook>>,
 }
 
 impl OrderBook {
+    pub fn calculate_spread(&mut self) {
+        if let (Some(best_bid), Some(best_ask)) = (self.bids.first(), self.asks.first()) {
+            self.spread = best_ask.price - best_bid.price;
+        } else {
+            self.spread = 0.0;
+        }
+    }
+    
     pub fn merge_and_sort(&mut self, new_bids: Vec<orderbook::Level>, new_asks: Vec<orderbook::Level>) {
-        // Add new bids and asks
         self.bids.extend(new_bids);
         self.asks.extend(new_asks);
-
-        // Sort bids and asks
-        // Bids are sorted in descending order by price
-        self.bids.sort_unstable_by(|a, b| b.price.partial_cmp(&a.price).unwrap());
-
-        // Asks are sorted in ascending order by price
-        self.asks.sort_unstable_by(|a, b| a.price.partial_cmp(&b.price).unwrap());
-
-        // Truncate bids and asks to get top 10
-        self.truncate(10);
+    
+        // Sort bids from high to low
+        self.bids.sort_unstable_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
+        // Sort asks from low to high
+        self.asks.sort_unstable_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
+    
+        // Limit to top 10
+        self.bids.truncate(10);
+        self.asks.truncate(10);
+    
+        // Calculate the spread
+        self.calculate_spread();
     }
 
     pub fn truncate(&mut self, depth: usize) {
@@ -64,41 +77,49 @@ impl OrderBook {
         self.asks.truncate(depth);
     }
 }
+impl MyOrderbookAggregator {
+    pub fn new(order_book: Arc<Mutex<OrderBook>>) -> Self {
+        Self { order_book }
+    }
+}
 
 
 #[tonic::async_trait]
-impl OrderbookAggregator for OrderbookAggregatorImpl {
+impl OrderbookAggregator for MyOrderbookAggregator {
     type BookSummaryStream = Pin<Box<dyn Stream<Item = Result<Summary, Status>> + Send + Sync + 'static>>;
-    
-    async fn book_summary(&self, _request: Request<Empty>) -> Result<Response<Self::BookSummaryStream>, Status> {
-        let order_book = Arc::clone(&self.order_book);
-        let (tx, rx) = tokio::sync::mpsc::channel(4);
-        tokio::spawn(async move {
-            loop {
-                // Fetch and lock the order book data
-                let mut data = order_book.lock().await;
-                
-                // Sort and keep only top 10 bids
-                data.bids.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
-                data.bids.truncate(10);
 
-                // Sort and keep only top 10 asks
-                data.asks.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
-                data.asks.truncate(10);
+    async fn book_summary(
+        &self,
+        request: Request<Empty>,
+    ) -> Result<Response<Self::BookSummaryStream>, Status> {
+        log::info!("Received request: {:?}", request);
 
-                // Create a summary message
-                let summary = Summary {
-                    spread: calculate_spread(&*data),
-                    bids: data.bids.clone(),
-                    asks: data.asks.clone(),
-                };
-                // Send the summary
-                tx.send(Ok(summary)).await.unwrap();
-                // Wait for a bit before the next summary
-                tokio::time::sleep(Duration::from_millis(100)).await
-            }
+        let order_book_clone = self.order_book.clone();
+
+        let output_stream = stream::unfold(order_book_clone, |order_book| async move {
+            let data = order_book.lock().await;
+            
+            let bids = data.bids.iter().map(|level| Level {
+                exchange: level.exchange.clone(),
+                price: level.price,
+                amount: level.amount,
+            }).collect();
+            
+            let asks = data.asks.iter().map(|level| Level {
+                exchange: level.exchange.clone(),
+                price: level.price,
+                amount: level.amount,
+            }).collect();
+
+            let update = Summary {
+                bids,
+                asks,
+                spread: data.spread,
+            };
+            log::info!("Sending response: {:?}", update);
+            Some((Ok(update), Arc::clone(&order_book)))
         });
-        let output_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+
         Ok(Response::new(Box::pin(output_stream)))
     }
 }
@@ -115,16 +136,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let order_book = Arc::new(Mutex::new(OrderBook {
         bids: Vec::new(),
         asks: Vec::new(),
+        spread: 0.0,
     }));
+
 
     let url_binance = format!("wss://stream.binance.com:9443/ws/{}@depth20@100ms", symbol);
     let url_bitstamp = format!("wss://ws.bitstamp.net");
     
-    match run(url_binance, url_bitstamp, symbol, order_book).await {
+    match run(url_binance, url_bitstamp, symbol, Arc::clone(&order_book)).await {
         Ok(()) => println!("Completed without error."),
         Err(err) => eprintln!("Error occurred: {:?}", err),
     }
 
+    let addr = "[::1]:50051".parse().unwrap();
+    let orderbook_aggregator = MyOrderbookAggregator::new(Arc::clone(&order_book));
+
+    Server::builder()
+        .add_service(OrderbookAggregatorServer::new(orderbook_aggregator))
+        .serve(addr)
+        .await?;
+   
     Ok(())
 }
 
@@ -140,10 +171,10 @@ async fn run(url_binance: String, url_bitstamp: String, symbol: String, order_bo
     });
     let _ = tokio::try_join!(binance, bitstamp)?;
 
-    let order_book_guard = order_book.lock().await;
-    println!("Final Bids: {:?}", order_book_guard.bids);
-    println!("Final Asks: {:?}", order_book_guard.asks);
-
+    let _order_book_guard = order_book.lock().await;
+    //println!("Final Bids: {:?}", order_book_guard.bids);
+    //println!("Final Asks: {:?}", order_book_guard.asks);
+    //println!("Final Spread: {:?}", order_book_guard.spread);
 
     Ok(())
 }
@@ -162,7 +193,7 @@ async fn connect_to_exchange(url: String, exchange: &str, symbol: &str, order_bo
         
         let (mut ws_stream, _) = tokio_tungstenite::client_async(&url, tls_stream).await
             .map_err(|e| anyhow::anyhow!("Failed to connect to {}: {}", exchange, e))?;
-        println!("Successfully connected to : {}", exchange);
+        //println!("Successfully connected to : {}", exchange);
 
         let subscribe_message_binance = format!(
             r#"{{
@@ -200,8 +231,6 @@ async fn connect_to_exchange(url: String, exchange: &str, symbol: &str, order_bo
                     // Merge and sort the order books
                     order_book_guard.merge_and_sort(new_bids, new_asks);
 
-                    println!("Binance Bids: {:?}", order_book_guard.bids);
-                    println!("Binance Asks: {:?}", order_book_guard.asks);
                     break;
                 }
                 Err(e) => {
@@ -225,7 +254,7 @@ async fn connect_to_exchange(url: String, exchange: &str, symbol: &str, order_bo
 
         let (mut ws_stream, _) = tokio_tungstenite::client_async(&url, tls_stream).await
             .map_err(|e| anyhow::anyhow!("Failed to connect to {}: {}", exchange, e))?;
-        println!("Successfully connected to : {}", exchange);
+        //println!("Successfully connected to : {}", exchange);
 
             
         let subscribe_message_bitstamp = json!({
@@ -244,7 +273,6 @@ async fn connect_to_exchange(url: String, exchange: &str, symbol: &str, order_bo
                     let v: Value = serde_json::from_str(&text)?;
                     let event = v.get("event").and_then(|e| e.as_str());
                     if event == Some("data") {
-                        //println!("raw data: {}", text);
                         let order_book_update = parse_order_book_update(&text, exchange)?;
                         // Update shared order book
                         let mut order_book_guard = order_book.lock().await;
@@ -262,9 +290,7 @@ async fn connect_to_exchange(url: String, exchange: &str, symbol: &str, order_bo
         
                         // Merge and sort the order books
                         order_book_guard.merge_and_sort(new_bids, new_asks);
-        
-                        println!("Bitstamp Bids: {:?}", order_book_guard.bids);
-                        println!("Bitstamp Asks: {:?}", order_book_guard.asks);
+
                         break;
                     }
                 }
@@ -280,15 +306,6 @@ async fn connect_to_exchange(url: String, exchange: &str, symbol: &str, order_bo
     Ok(())
 }
 
-
-
-fn calculate_spread(order_book: &OrderBook) -> f64 {
-    if let (Some(best_bid), Some(best_ask)) = (order_book.bids.first(), order_book.asks.first()) {
-        best_ask.price - best_bid.price
-    } else {
-        0.0
-    }
-}
 
 fn parse_order_book_update(message: &str, exchange: &str) -> anyhow::Result<OrderBook> {
     
@@ -347,17 +364,15 @@ fn parse_order_book_update(message: &str, exchange: &str) -> anyhow::Result<Orde
                 })
                 .collect::<Result<Vec<_>, anyhow::Error>>()?;
 
-            return Ok(OrderBook { bids, asks });
+            return Ok(OrderBook { bids, asks, spread: 0.0 });
         } else {
             Err(anyhow::anyhow!("The message did not contain the 'data' field"))
         }
 
     } else {
-        //println!("Binance data: {}", v);
         let parsed_bids = v["bids"]
             .as_array()
-            .ok_or(anyhow::anyhow!("bids is not an array"))?;
-        //println!("Binance bids: {:?}", parsed_bids); 
+            .ok_or(anyhow::anyhow!("bids is not an array"))?; 
         
         let bids = parsed_bids
             .iter()
@@ -382,7 +397,6 @@ fn parse_order_book_update(message: &str, exchange: &str) -> anyhow::Result<Orde
                     anyhow::anyhow!(err)
                 })?;
         
-                //println!("Parsed Binance bid: price {}, amount {}", price, amount);
                 Ok(orderbook::Level {
                     exchange: exchange.to_string(),
                     price,
@@ -395,7 +409,6 @@ fn parse_order_book_update(message: &str, exchange: &str) -> anyhow::Result<Orde
         let parsed_asks = v["asks"]
             .as_array()
             .ok_or(anyhow::anyhow!("asks is not an array"))?;
-        //println!("Binance asks: {:?}", parsed_asks);
 
         let asks = parsed_asks
             .iter()
@@ -420,7 +433,6 @@ fn parse_order_book_update(message: &str, exchange: &str) -> anyhow::Result<Orde
                     anyhow::anyhow!(err)
                 })?;
         
-                //println!("Parsed Binance ask: price {}, amount {}", price, amount);
                 Ok(orderbook::Level {
                     exchange: exchange.to_string(),
                     price,
@@ -429,7 +441,7 @@ fn parse_order_book_update(message: &str, exchange: &str) -> anyhow::Result<Orde
             })
             .collect::<Result<Vec<_>, anyhow::Error>>()?;
 
-        Ok(OrderBook { bids, asks })
+        Ok(OrderBook { bids, asks, spread: 0.0 })
     }
 }
 

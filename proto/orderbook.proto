@@ -1,9 +1,11 @@
 syntax = "proto3";
+
 package orderbook;
 
 service OrderbookAggregator {
     rpc BookSummary(Empty) returns (stream Summary);
 }
+
 message Empty {}
 
 message Summary {
