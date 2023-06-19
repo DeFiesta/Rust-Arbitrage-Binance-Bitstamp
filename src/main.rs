@@ -14,11 +14,11 @@ use tokio::sync::Mutex;
 use std::sync::Arc;
 use std::pin::Pin;
 use core::time::Duration;
-use log::{info, error};
+use log::error;
 use serde_json::json;
 
 use orderbook::{orderbook_aggregator_server::{OrderbookAggregator, OrderbookAggregatorServer}, Summary, Empty};
-use tonic::{transport::Server, Request, Response, Status};
+use tonic::{Request, Response, Status};
 
 // used to parse orderbook update
 use serde_json::Value;
@@ -41,6 +41,31 @@ pub struct OrderbookAggregatorImpl {
     pub order_book: Arc<Mutex<OrderBook>>,
 }
 
+impl OrderBook {
+    pub fn merge_and_sort(&mut self, new_bids: Vec<orderbook::Level>, new_asks: Vec<orderbook::Level>) {
+        // Add new bids and asks
+        self.bids.extend(new_bids);
+        self.asks.extend(new_asks);
+
+        // Sort bids and asks
+        // Bids are sorted in descending order by price
+        self.bids.sort_unstable_by(|a, b| b.price.partial_cmp(&a.price).unwrap());
+
+        // Asks are sorted in ascending order by price
+        self.asks.sort_unstable_by(|a, b| a.price.partial_cmp(&b.price).unwrap());
+
+        // Truncate bids and asks to get top 10
+        self.truncate(10);
+    }
+
+    pub fn truncate(&mut self, depth: usize) {
+        // Limit the depth of the order book
+        self.bids.truncate(depth);
+        self.asks.truncate(depth);
+    }
+}
+
+
 #[tonic::async_trait]
 impl OrderbookAggregator for OrderbookAggregatorImpl {
     type BookSummaryStream = Pin<Box<dyn Stream<Item = Result<Summary, Status>> + Send + Sync + 'static>>;
@@ -51,10 +76,19 @@ impl OrderbookAggregator for OrderbookAggregatorImpl {
         tokio::spawn(async move {
             loop {
                 // Fetch and lock the order book data
-                let data = order_book.lock().await;
+                let mut data = order_book.lock().await;
+                
+                // Sort and keep only top 10 bids
+                data.bids.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
+                data.bids.truncate(10);
+
+                // Sort and keep only top 10 asks
+                data.asks.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
+                data.asks.truncate(10);
+
                 // Create a summary message
                 let summary = Summary {
-                    spread: calculate_spread(&data),
+                    spread: calculate_spread(&*data),
                     bids: data.bids.clone(),
                     asks: data.asks.clone(),
                 };
@@ -83,46 +117,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
         asks: Vec::new(),
     }));
 
-    let binance_url = format!("wss://stream.binance.com:9443/ws/{}@depth20@100ms", symbol);
-    let bitstamp_url = format!("wss://ws.bitstamp.net");
-
-    let binance_future = connect_to_exchange(binance_url, "binance", &symbol, Arc::clone(&order_book));
-    let bitstamp_future = connect_to_exchange(bitstamp_url, "bitstamp", &symbol, Arc::clone(&order_book));
-
-    println!("Created futures for binance and bitstamp");
-
-    // start gRPC server in a new thread
-    let grpc_service = OrderbookAggregatorImpl {
-        order_book: Arc::clone(&order_book),
-    };
+    let url_binance = format!("wss://stream.binance.com:9443/ws/{}@depth20@100ms", symbol);
+    let url_bitstamp = format!("wss://ws.bitstamp.net");
     
-    let grpc_future = tokio::spawn(async move {
-        Server::builder()
-            .add_service(OrderbookAggregatorServer::new(grpc_service))
-            .serve("127.0.0.1:50051".parse().unwrap())
-            .await
+    match run(url_binance, url_bitstamp, symbol, order_book).await {
+        Ok(()) => println!("Completed without error."),
+        Err(err) => eprintln!("Error occurred: {:?}", err),
+    }
+
+    Ok(())
+}
+
+async fn run(url_binance: String, url_bitstamp: String, symbol: String, order_book: Arc<Mutex<OrderBook>>,) -> anyhow::Result<()> {
+    let binance_orderbook = Arc::clone(&order_book);
+    let bitstamp_orderbook = Arc::clone(&order_book);
+    let binance_symbol = symbol.clone();
+    let binance = tokio::spawn(async move {
+        connect_to_exchange(url_binance, "binance", &binance_symbol, binance_orderbook).await
     });
+    let bitstamp = tokio::spawn(async move {
+        connect_to_exchange(url_bitstamp, "bitstamp", &symbol, bitstamp_orderbook).await
+    });
+    let _ = tokio::try_join!(binance, bitstamp)?;
 
+    let order_book_guard = order_book.lock().await;
+    println!("Final Bids: {:?}", order_book_guard.bids);
+    println!("Final Asks: {:?}", order_book_guard.asks);
 
-    // run all futures to completion
-    let (websocket_result1, websocket_result2, grpc_server) = futures::future::join3(binance_future, bitstamp_future, grpc_future).await;
-
-    println!("Futures completed");
-
-    match websocket_result1 {
-        Ok(_) => info!("Websocket connection to Binance closed successfully."),
-        Err(e) => error!("An error occurred in the websocket connection to Binance: {}", e),
-    }
-    
-    match websocket_result2 {
-        Ok(_) => info!("Websocket connection to Bitstamp closed successfully."),
-        Err(e) => error!("An error occurred in the websocket connection to Bitstamp: {}", e),
-    }
-    
-    match grpc_server {
-        Ok(_) => info!("gRPC server closed successfully."),
-        Err(e) => error!("An error occurred in the gRPC server: {}", e),
-    }
 
     Ok(())
 }
@@ -131,34 +152,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 async fn connect_to_exchange(url: String, exchange: &str, symbol: &str, order_book: Arc<Mutex<OrderBook>>) -> anyhow::Result<()> {
     
-    let modified_url = Url::parse(&url).unwrap();
-    let domain = modified_url.domain().unwrap().to_string();
-    let addr = modified_url.socket_addrs(|| None).unwrap().first().unwrap().to_string();
-    let stream = TcpStream::connect(addr).await.unwrap();
-    let connector = tokio_native_tls::TlsConnector::from(native_tls::TlsConnector::new()?);
-    let tls_stream = connector.connect(&domain, stream).await.unwrap();
-    
-    let (mut ws_stream, _) = tokio_tungstenite::client_async(&url, tls_stream).await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to {}: {}", exchange, e))?;
-    
-     // Send subscription message based on the exchange.
-    let bitstamp_symbol = if symbol.ends_with("t") {
-        &symbol[..symbol.len()-1]  // remove last character
-    } else {
-        symbol
-    };
-     if exchange == "bitstamp" {
-        let subscribe_message_bitstamp = json!({
-            "event": "bts:subscribe",
-            "data": {
-                "channel": format!("detail_order_book_{}", bitstamp_symbol)
-            }
-        }).to_string();
+    if exchange == "binance" {
+        let modified_url = Url::parse(&url).unwrap();
+        let domain = modified_url.domain().unwrap().to_string();
+        let addr = modified_url.socket_addrs(|| None).unwrap().first().unwrap().to_string();
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let connector = tokio_native_tls::TlsConnector::from(native_tls::TlsConnector::new()?);
+        let tls_stream = connector.connect(&domain, stream).await.unwrap();
+        
+        let (mut ws_stream, _) = tokio_tungstenite::client_async(&url, tls_stream).await
+            .map_err(|e| anyhow::anyhow!("Failed to connect to {}: {}", exchange, e))?;
+        println!("Successfully connected to : {}", exchange);
 
-        ws_stream.send(Message::Text(subscribe_message_bitstamp)).await.unwrap();
-        println!("Subscribed to the {} trades channel for {}", exchange, bitstamp_symbol);
-
-    } else if exchange == "binance" {
         let subscribe_message_binance = format!(
             r#"{{
                 "method": "SUBSCRIBE",
@@ -171,30 +176,104 @@ async fn connect_to_exchange(url: String, exchange: &str, symbol: &str, order_bo
             symbol, symbol
         );
         ws_stream.send(Message::Text(subscribe_message_binance)).await?;
+
+        while let Some(msg) = ws_stream.next().await {
+            match msg {
+                Ok(TMessage::Text(text)) => {
+                    
+                    let order_book_update = parse_order_book_update(&text, exchange)?;
+                    // Update shared order book
+                    let mut order_book_guard = order_book.lock().await;
+                    // Prepare new Levels from the update
+                    let new_bids: Vec<orderbook::Level> = order_book_update.bids.into_iter().map(|level| orderbook::Level {
+                        exchange: exchange.to_string(),
+                        price: level.price,
+                        amount: level.amount,
+                    }).collect();
+
+                    let new_asks: Vec<orderbook::Level> = order_book_update.asks.into_iter().map(|level| orderbook::Level {
+                        exchange: exchange.to_string(),
+                        price: level.price,
+                        amount: level.amount,
+                    }).collect();
+
+                    // Merge and sort the order books
+                    order_book_guard.merge_and_sort(new_bids, new_asks);
+
+                    println!("Binance Bids: {:?}", order_book_guard.bids);
+                    println!("Binance Asks: {:?}", order_book_guard.asks);
+                    break;
+                }
+                Err(e) => {
+                    error!("Error receiving message from {}: {}", exchange, e);
+                    break;
+                }
+                _ => (),
+            }
+        }
     }
+    
 
+    else if exchange == "bitstamp" {
 
-    // main loop for handling messages
-    while let Some(msg) = ws_stream.next().await {
-        match msg {
-            Ok(TMessage::Text(text)) => {
-                println!("raw data: {}", text);
-                let order_book_update = parse_order_book_update(&text, exchange)?;
-                //println!("orderbook update : {:?}", order_book_update);
+        let modified_url = Url::parse(&url).unwrap();
+        let domain = modified_url.domain().unwrap().to_string();
+        let addr = modified_url.socket_addrs(|| None).unwrap().first().unwrap().to_string();
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let connector = tokio_native_tls::TlsConnector::from(native_tls::TlsConnector::new()?);
+        let tls_stream = connector.connect(&domain, stream).await.unwrap();
 
-                // Update shared order book
-                let mut order_book_guard = order_book.lock().await;
-                order_book_guard.bids = order_book_update.bids;
-                order_book_guard.asks = order_book_update.asks;
+        let (mut ws_stream, _) = tokio_tungstenite::client_async(&url, tls_stream).await
+            .map_err(|e| anyhow::anyhow!("Failed to connect to {}: {}", exchange, e))?;
+        println!("Successfully connected to : {}", exchange);
 
-                //println!("bids parsing result: {:?}", order_book_guard.bids);
-                //println!("asks parsing result: {:?}", order_book_guard.asks);
+            
+        let subscribe_message_bitstamp = json!({
+            "event": "bts:subscribe",
+            "data": {
+                "channel": format!("order_book_{}", symbol)
             }
-            Err(e) => {
-                error!("Error receiving message from {}: {}", exchange, e);
-                break;
+        }).to_string();
+        
+        ws_stream.send(Message::Text(subscribe_message_bitstamp)).await?;
+        
+        while let Some(msg) = ws_stream.next().await {
+            match msg {
+                Ok(TMessage::Text(text)) => {
+                    // Check the event type to ensure it is an order book update
+                    let v: Value = serde_json::from_str(&text)?;
+                    let event = v.get("event").and_then(|e| e.as_str());
+                    if event == Some("data") {
+                        //println!("raw data: {}", text);
+                        let order_book_update = parse_order_book_update(&text, exchange)?;
+                        // Update shared order book
+                        let mut order_book_guard = order_book.lock().await;
+                        let new_bids: Vec<orderbook::Level> = order_book_update.bids.into_iter().map(|level| orderbook::Level {
+                            exchange: exchange.to_string(),
+                            price: level.price,
+                            amount: level.amount,
+                        }).collect();
+        
+                        let new_asks: Vec<orderbook::Level> = order_book_update.asks.into_iter().map(|level| orderbook::Level {
+                            exchange: exchange.to_string(),
+                            price: level.price,
+                            amount: level.amount,
+                        }).collect();
+        
+                        // Merge and sort the order books
+                        order_book_guard.merge_and_sort(new_bids, new_asks);
+        
+                        println!("Bitstamp Bids: {:?}", order_book_guard.bids);
+                        println!("Bitstamp Asks: {:?}", order_book_guard.asks);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    error!("Error receiving message from {}: {}", exchange, e);
+                    break;
+                }
+                _ => (),
             }
-            _ => (),
         }
     }
 
@@ -218,18 +297,23 @@ fn parse_order_book_update(message: &str, exchange: &str) -> anyhow::Result<Orde
     // Modify this to get 'data' first for Bitstamp
     if exchange == "bitstamp" {
         if let Some(data) = v.get("data") {
-            println!("Bitstamp data: {}", data);
             let bids = data["bids"]
                 .as_array()
-                .ok_or(anyhow::anyhow!("bids is not an array"))?;
-            println!("Bitstamp bids: {:?}", bids);
-            
-            let parsed_bids = bids
+                .ok_or(anyhow::anyhow!("bids is not an array"))?
                 .iter()
                 .map(|bid| {
-                    let price = bid[0].as_f64().ok_or_else(|| anyhow::anyhow!("price is not a number"))?;
-                    let amount = bid[1].as_f64().ok_or_else(|| anyhow::anyhow!("amount is not a number"))?;
-                    println!("Parsed Bitstamp bid: price {}, amount {}", price, amount);
+                    let price = bid[0]
+                        .as_str()
+                        .ok_or(anyhow::anyhow!("bid price is not a string"))?
+                        .parse::<f64>()
+                        .map_err(|_| anyhow::anyhow!("failed to parse bid price as f64"))?;
+
+                    let amount = bid[1]
+                        .as_str()
+                        .ok_or(anyhow::anyhow!("bid amount is not a string"))?
+                        .parse::<f64>()
+                        .map_err(|_| anyhow::anyhow!("failed to parse bid amount as f64"))?;
+
                     Ok(orderbook::Level {
                         exchange: exchange.to_string(),
                         price,
@@ -237,20 +321,24 @@ fn parse_order_book_update(message: &str, exchange: &str) -> anyhow::Result<Orde
                     })
                 })
                 .collect::<Result<Vec<_>, anyhow::Error>>()?;
-
-            println!("Parsed Bitstamp bids: {:?}", parsed_bids); // <-- Add this
 
             let asks = data["asks"]
                 .as_array()
-                .ok_or(anyhow::anyhow!("asks is not an array"))?;
-            println!("Bitstamp asks: {:?}", asks); 
-            
-            let parsed_asks = asks
+                .ok_or(anyhow::anyhow!("asks is not an array"))?
                 .iter()
                 .map(|ask| {
-                    let price = ask[0].as_f64().ok_or_else(|| anyhow::anyhow!("price is not a number"))?;
-                    let amount = ask[1].as_f64().ok_or_else(|| anyhow::anyhow!("amount is not a number"))?;
-                    println!("Parsed Bitstamp ask: price {}, amount {}", price, amount); 
+                    let price = ask[0]
+                        .as_str()
+                        .ok_or(anyhow::anyhow!("ask price is not a string"))?
+                        .parse::<f64>()
+                        .map_err(|_| anyhow::anyhow!("failed to parse ask price as f64"))?;
+
+                    let amount = ask[1]
+                        .as_str()
+                        .ok_or(anyhow::anyhow!("ask amount is not a string"))?
+                        .parse::<f64>()
+                        .map_err(|_| anyhow::anyhow!("failed to parse ask amount as f64"))?;
+
                     Ok(orderbook::Level {
                         exchange: exchange.to_string(),
                         price,
@@ -259,12 +347,11 @@ fn parse_order_book_update(message: &str, exchange: &str) -> anyhow::Result<Orde
                 })
                 .collect::<Result<Vec<_>, anyhow::Error>>()?;
 
-            println!("Parsed Bitstamp asks: {:?}", parsed_asks); 
-
-            Ok(OrderBook { bids: parsed_bids, asks: parsed_asks })
+            return Ok(OrderBook { bids, asks });
         } else {
             Err(anyhow::anyhow!("The message did not contain the 'data' field"))
         }
+
     } else {
         //println!("Binance data: {}", v);
         let parsed_bids = v["bids"]
@@ -345,9 +432,4 @@ fn parse_order_book_update(message: &str, exchange: &str) -> anyhow::Result<Orde
         Ok(OrderBook { bids, asks })
     }
 }
-
-
-
-
-
 
